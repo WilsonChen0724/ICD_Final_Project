@@ -56,7 +56,6 @@ reg [7:0] line1 [0:63];
 reg [7:0] line2 [0:63];
 
 // input stream counters
-reg [6:0] read_row;       // next source row to read, 0..64
 reg [6:0] loaded_count;   // number of source rows already loaded
 reg [1:0] read_row_mod;   // read_row % 3
 reg [3:0] read_grp;       // 0..15, each group contains 4 pixels
@@ -64,6 +63,7 @@ reg [3:0] read_grp;       // 0..15, each group contains 4 pixels
 // output-row counters
 reg [5:0] out_row;
 reg [3:0] out_grp;
+reg [1:0] center_row_mod;
 
 integer i;
 
@@ -77,21 +77,30 @@ wire need_read_more = (required_bottom_row <= 7'd63) &&
 
 // ============================================================
 // Read a buffered image pixel with zero-padding.
-// rr/cc are signed because rr-1 or cc-1 may be negative.
-// Row buffer selection uses rr % 3 because rows are stored circularly.
+// row_sel is tracked by counters to avoid synthesizing modulo logic.
 // ============================================================
-function [7:0] get_pixel;
-    input signed [7:0] rr;
+function [7:0] read_line;
+    input [1:0] row_sel;
+    input [5:0] col;
+    begin
+        if (row_sel == 2'd0)
+            read_line = line0[col];
+        else if (row_sel == 2'd1)
+            read_line = line1[col];
+        else
+            read_line = line2[col];
+    end
+endfunction
+
+function [7:0] get_pixel_sel;
+    input zero_row;
+    input [1:0] row_sel;
     input signed [7:0] cc;
     begin
-        if (rr < 0 || rr > 63 || cc < 0 || cc > 63) begin
-            get_pixel = 8'd0;
+        if (zero_row || cc < 0 || cc > 63) begin
+            get_pixel_sel = 8'd0;
         end else begin
-            case (rr % 3)
-                2'd0: get_pixel = line0[cc[5:0]];
-                2'd1: get_pixel = line1[cc[5:0]];
-                default: get_pixel = line2[cc[5:0]];
-            endcase
+            get_pixel_sel = read_line(row_sel, cc[5:0]);
         end
     end
 endfunction
@@ -118,29 +127,16 @@ function [7:0] cube_root_floor;
     reg [5:0] mid;
     reg [6:0] mid_sum;
     reg [11:0] mid2;
-    reg [11:0] mid_ext;
     reg [17:0] mid3;
     integer k;
-    integer j;
     begin
         lo = 6'd0;
         hi = 6'd40;
         for (k = 0; k < 6; k = k + 1) begin
             mid_sum = {1'b0, lo} + {1'b0, hi} + 7'd1;
             mid = mid_sum[6:1];
-            mid_ext = {6'd0, mid};
-
-            mid2 = 12'd0;
-            for (j = 0; j < 6; j = j + 1) begin
-                if (mid[j])
-                    mid2 = mid2 + (mid_ext << j);
-            end
-
-            mid3 = 18'd0;
-            for (j = 0; j < 6; j = j + 1) begin
-                if (mid[j])
-                    mid3 = mid3 + ({6'd0, mid2} << j);
-            end
+            mid2 = {6'd0, mid} * {6'd0, mid};
+            mid3 = {6'd0, mid2} * {12'd0, mid};
 
             if (mid3 <= target)
                 lo = mid;
@@ -153,15 +149,8 @@ endfunction
 
 function [15:0] square_u8;
     input [7:0] x;
-    reg [15:0] x_ext;
-    integer j;
     begin
-        x_ext = {8'd0, x};
-        square_u8 = 16'd0;
-        for (j = 0; j < 8; j = j + 1) begin
-            if (x[j])
-                square_u8 = square_u8 + (x_ext << j);
-        end
+        square_u8 = {8'd0, x} * {8'd0, x};
     end
 endfunction
 
@@ -178,15 +167,10 @@ endfunction
 function signed [21:0] mul_pixel_weight;
     input [7:0] p;
     input signed [7:0] w;
-    reg signed [21:0] w_ext;
-    integer j;
+    reg signed [16:0] prod;
     begin
-        w_ext = {{14{w[7]}}, w};
-        mul_pixel_weight = 22'sd0;
-        for (j = 0; j < 8; j = j + 1) begin
-            if (p[j])
-                mul_pixel_weight = mul_pixel_weight + (w_ext <<< j);
-        end
+        prod = $signed({1'b0, p}) * w;
+        mul_pixel_weight = {{5{prod[16]}}, prod};
     end
 endfunction
 
@@ -210,6 +194,11 @@ function [7:0] calc_one;
     input [6:0] center_c;
     reg signed [7:0] cr;
     reg signed [7:0] cc;
+    reg [1:0] top_sel;
+    reg [1:0] mid_sel;
+    reg [1:0] bot_sel;
+    reg top_zero;
+    reg bot_zero;
     reg [7:0] p0, p1, p2;
     reg [7:0] p3, p4, p5;
     reg [7:0] p6, p7, p8;
@@ -221,15 +210,21 @@ function [7:0] calc_one;
         cr = {1'b0, center_r};
         cc = {1'b0, center_c};
 
-        p0 = get_pixel(cr - 8'sd1, cc - 8'sd1);
-        p1 = get_pixel(cr - 8'sd1, cc          );
-        p2 = get_pixel(cr - 8'sd1, cc + 8'sd1);
-        p3 = get_pixel(cr          , cc - 8'sd1);
-        p4 = get_pixel(cr          , cc          );
-        p5 = get_pixel(cr          , cc + 8'sd1);
-        p6 = get_pixel(cr + 8'sd1, cc - 8'sd1);
-        p7 = get_pixel(cr + 8'sd1, cc          );
-        p8 = get_pixel(cr + 8'sd1, cc + 8'sd1);
+        mid_sel = center_row_mod;
+        top_sel = (center_row_mod == 2'd0) ? 2'd2 : (center_row_mod - 2'd1);
+        bot_sel = (center_row_mod == 2'd2) ? 2'd0 : (center_row_mod + 2'd1);
+        top_zero = (cr == 8'sd0);
+        bot_zero = (cr == 8'sd63);
+
+        p0 = get_pixel_sel(top_zero, top_sel, cc - 8'sd1);
+        p1 = get_pixel_sel(top_zero, top_sel, cc          );
+        p2 = get_pixel_sel(top_zero, top_sel, cc + 8'sd1);
+        p3 = get_pixel_sel(1'b0,     mid_sel, cc - 8'sd1);
+        p4 = get_pixel_sel(1'b0,     mid_sel, cc          );
+        p5 = get_pixel_sel(1'b0,     mid_sel, cc + 8'sd1);
+        p6 = get_pixel_sel(bot_zero, bot_sel, cc - 8'sd1);
+        p7 = get_pixel_sel(bot_zero, bot_sel, cc          );
+        p8 = get_pixel_sel(bot_zero, bot_sel, cc + 8'sd1);
 
         acc = 22'sd0;
         acc = acc + mul_pixel_weight(p0, w0);
@@ -369,12 +364,12 @@ always @(posedge i_clk or negedge i_rst_n) begin
         w6 <= 8'sd0; w7 <= 8'sd0; w8 <= 8'sd0;
         stride_reg <= 1'b0;
 
-        read_row <= 7'd0;
         loaded_count <= 7'd0;
         read_row_mod <= 2'd0;
         read_grp <= 4'd0;
         out_row <= 6'd0;
         out_grp <= 4'd0;
+        center_row_mod <= 2'd0;
 
         for (i = 0; i < 64; i = i + 1) begin
             line0[i] <= 8'd0;
@@ -421,12 +416,12 @@ always @(posedge i_clk or negedge i_rst_n) begin
             // ------------------------------------------------------------
             S_GAP: begin
                 o_in_ready <= 1'b0;
-                read_row <= 7'd0;
                 loaded_count <= 7'd0;
                 read_row_mod <= 2'd0;
                 read_grp <= 4'd0;
                 out_row <= 6'd0;
                 out_grp <= 4'd0;
+                center_row_mod <= 2'd0;
                 state <= S_DECIDE;
             end
 
@@ -457,7 +452,6 @@ always @(posedge i_clk or negedge i_rst_n) begin
 
                     if (read_grp == 4'd15) begin
                         read_grp <= 4'd0;
-                        read_row <= read_row + 7'd1;
                         loaded_count <= loaded_count + 7'd1;
                         read_row_mod <= mod3_plus1(read_row_mod);
                         o_in_ready <= 1'b0;
@@ -486,6 +480,10 @@ always @(posedge i_clk or negedge i_rst_n) begin
                         state <= S_FINISH;
                     end else begin
                         out_row <= out_row + 6'd1;
+                        if (stride_reg)
+                            center_row_mod <= mod3_plus1(mod3_plus1(center_row_mod));
+                        else
+                            center_row_mod <= mod3_plus1(center_row_mod);
                         state <= S_DECIDE;
                     end
                 end else begin

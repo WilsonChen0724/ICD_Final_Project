@@ -109,29 +109,16 @@ function [7:0] cube_root_floor;
     reg [5:0] mid;
     reg [6:0] mid_sum;
     reg [11:0] mid2;
-    reg [11:0] mid_ext;
     reg [17:0] mid3;
     integer k;
-    integer j;
     begin
         lo = 6'd0;
         hi = 6'd40;
         for (k = 0; k < 6; k = k + 1) begin
             mid_sum = {1'b0, lo} + {1'b0, hi} + 7'd1;
             mid = mid_sum[6:1];
-            mid_ext = {6'd0, mid};
-
-            mid2 = 12'd0;
-            for (j = 0; j < 6; j = j + 1) begin
-                if (mid[j])
-                    mid2 = mid2 + (mid_ext << j);
-            end
-
-            mid3 = 18'd0;
-            for (j = 0; j < 6; j = j + 1) begin
-                if (mid[j])
-                    mid3 = mid3 + ({6'd0, mid2} << j);
-            end
+            mid2 = {6'd0, mid} * {6'd0, mid};
+            mid3 = {6'd0, mid2} * {12'd0, mid};
 
             if (mid3 <= target)
                 lo = mid;
@@ -144,15 +131,8 @@ endfunction
 
 function [15:0] square_u8;
     input [7:0] x;
-    reg [15:0] x_ext;
-    integer j;
     begin
-        x_ext = {8'd0, x};
-        square_u8 = 16'd0;
-        for (j = 0; j < 8; j = j + 1) begin
-            if (x[j])
-                square_u8 = square_u8 + (x_ext << j);
-        end
+        square_u8 = {8'd0, x} * {8'd0, x};
     end
 endfunction
 
@@ -169,15 +149,10 @@ endfunction
 function signed [21:0] mul_pixel_weight;
     input [7:0] p;
     input signed [7:0] w;
-    reg signed [21:0] w_ext;
-    integer j;
+    reg signed [16:0] prod;
     begin
-        w_ext = {{14{w[7]}}, w};
-        mul_pixel_weight = 22'sd0;
-        for (j = 0; j < 8; j = j + 1) begin
-            if (p[j])
-                mul_pixel_weight = mul_pixel_weight + (w_ext <<< j);
-        end
+        prod = $signed({1'b0, p}) * w;
+        mul_pixel_weight = {{5{prod[16]}}, prod};
     end
 endfunction
 
