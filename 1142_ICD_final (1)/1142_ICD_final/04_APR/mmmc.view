@@ -1,0 +1,13 @@
+# Version:1.0 MMMC View Definition File
+# Do Not Remove Above Line
+create_rc_corner -name RC_worst -preRoute_res {1.0} -preRoute_cap {1.0} -preRoute_clkres {0.0} -preRoute_clkcap {0.0} -postRoute_res {1.0} -postRoute_cap {1.0} -postRoute_xcap {1.0} -postRoute_clkres {0.0} -postRoute_clkcap {0.0} -qx_tech_file {/share1/tech/ADFP/Executable_Package/Collaterals/Tech/RC/N16ADFP_QRC/worst/qrcTechFile}
+
+create_library_set -name lib_0p72v_125c -timing {/share1/tech/ADFP/Executable_Package/Collaterals/IP/stdcell/N16ADFP_StdCell/CCS/N16ADFP_StdCellss0p72v125c_ccs.lib /share1/tech/ADFP/Executable_Package/Collaterals/IP/stdio/N16ADFP_StdIO/NLDM/N16ADFP_StdIOss0p72v1p62v125c.lib /share1/tech/ADFP/Lab_adfp/library/memory/rf_2p_hse_nldm_ss_0p72v_0p72v_125c_syn.lib}
+
+create_constraint_mode -name CM_func -sdc_files {./design/core_syn.sdc}
+
+create_delay_corner -name DC_0p72v_125c -library_set {lib_0p72v_125c} -rc_corner {RC_worst}
+
+create_analysis_view -name AV_func_0p72v_125c -constraint_mode {CM_func} -delay_corner {DC_0p72v_125c}
+
+set_analysis_view -setup {AV_func_0p72v_125c} -hold {AV_func_0p72v_125c}

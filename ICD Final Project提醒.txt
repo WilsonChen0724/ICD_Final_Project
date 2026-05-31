@@ -1,0 +1,43 @@
+以下幾點補充，請大家再注意一下，謝謝
+
+1. final & final.dat 一樣是analyze floorplan之前存檔
+
+2. 請把tb跑每一個public case的圖都放report，最後會是把全部取平均當作你的preformance裡的time指標
+
+3.按照我們給的script去stream out .gds檔案，應該會得到CHIP.gds，請幫我改名為core.gds
+
+4. 資料夾正確的檔名應該是"<student_id>_hw6" 而不是 "<student_id>_hw6/"
+
+(1)
+由於禁止LUT，因此下方兩種寫法都是禁止的:
+
+(a)
+
+if(x<=a)
+
+return 1
+
+elseif(x<=b)
+
+return 2
+
+...
+
+(b)
+
+case(x):
+
+ x==a: return 1
+
+ x==b: return 2
+
+....
+
+endcase
+
+ 
+
+(2) 這裡提供一個基礎的方法給同學參考:
+假設輸出範圍從0~a，求(x)^1/3，可以利用binary search，先計算(a/2)^3，如果小於x就再計算(3a/4)^3，大於x就再計算(a/4)^3，以此類推。
+
+可以使用其他方法，但如果不確定是否有違反規定可以寄信詢問。
