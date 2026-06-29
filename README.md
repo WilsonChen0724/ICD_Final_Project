@@ -64,23 +64,3 @@ x^(2/3) = cube_root(x^2)
 ```
 
 The cube root is implemented using a six-stage digit-by-digit arithmetic pipeline with digit trials `32, 16, 8, 4, 2, 1`. It is not implemented as a lookup table.
-
-## Recommended Git Workflow
-
-To commit the cleaned project structure:
-
-```powershell
-git status --short
-git add README.md final_submission core_versions constraints b13901080_report.pdf
-git commit -m "Organize final RTL submission and design history"
-git push
-```
-
-Before committing, inspect any modified files under the original course package:
-
-```powershell
-git status --short
-git diff --stat
-```
-
-Avoid using `git add .` until you confirm whether local testbench or run-script modifications should be part of the GitHub version.
