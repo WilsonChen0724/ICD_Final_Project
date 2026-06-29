@@ -27,27 +27,20 @@ module core (
 );
 
 // ============================================================
-// Streaming line-buffer version
-// ------------------------------------------------------------
-// Important design choice:
-// The testbench sends the whole image continuously after the
-// one-cycle gap. Therefore this design keeps o_in_ready high
-// during the whole image input phase and computes outputs in
-// parallel with input reception.
-//
-// This version uses a 4-row rolling line buffer instead of 3 rows.
-// Reason: while computing row r, the circuit is already receiving
-// row r+2. The fourth row prevents the new input row from overwriting
-// the top row still needed by the current 3x3 window.
-// This is still a line-buffer design, not full 64x64 image storage.
+// 3-line row-at-a-time line-buffer version.
+// The design reads only the rows needed for the current output row,
+// pulls o_in_ready low while calculating that row, then reads the next
+// source row. This avoids the fourth line buffer used by the streaming
+// implementation.
 // ============================================================
 
 localparam S_IDLE   = 3'd0;
 localparam S_GET_W  = 3'd1;
 localparam S_GAP    = 3'd2;
-localparam S_STREAM = 3'd3;
-localparam S_FLUSH  = 3'd4;
-localparam S_FINISH = 3'd5;
+localparam S_DECIDE = 3'd3;
+localparam S_READ   = 3'd4;
+localparam S_CALC   = 3'd5;
+localparam S_FINISH = 3'd6;
 
 reg [2:0] state;
 
@@ -57,43 +50,68 @@ reg signed [7:0] w3, w4, w5;
 reg signed [7:0] w6, w7, w8;
 reg stride_reg;
 
-// 4-row rolling line buffer
+// 3-row rolling line buffer
 reg [7:0] line0 [0:63];
 reg [7:0] line1 [0:63];
 reg [7:0] line2 [0:63];
-reg [7:0] line3 [0:63];
 
 // input stream counters
-reg [6:0] read_row;   // 0..63
-reg [3:0] read_grp;   // 0..15, each group contains 4 pixels
+reg [6:0] loaded_count;   // number of source rows already loaded
+reg [1:0] read_row_mod;   // read_row % 3
+reg [3:0] read_grp;       // 0..15, each group contains 4 pixels
 
-// flush counters for the last rows after input ends
-reg [5:0] flush_out_r;
-reg [3:0] flush_grp;
+// output-row counters
+reg [5:0] out_row;
+reg [3:0] out_grp;
+reg [1:0] center_row_mod;
 
 integer i;
 
 wire [5:0] in_col_base = {read_grp, 2'b00};
+wire [5:0] last_out_row = stride_reg ? 6'd31 : 6'd63;
+wire [3:0] last_out_grp = stride_reg ? 4'd7 : 4'd15;
+wire [6:0] center_row = stride_reg ? {out_row, 1'b0} : {1'b0, out_row};
+wire [6:0] required_bottom_row = center_row + 7'd1;
+wire need_read_more = (required_bottom_row <= 7'd63) &&
+                      (loaded_count <= required_bottom_row);
 
 // ============================================================
 // Read a buffered image pixel with zero-padding.
-// rr/cc are signed because rr-1 or cc-1 may be negative.
-// row buffer selection uses rr[1:0], equivalent to rr % 4.
+// row_sel is tracked by counters to avoid synthesizing modulo logic.
 // ============================================================
-function [7:0] get_pixel;
-    input signed [7:0] rr;
+function [7:0] read_line;
+    input [1:0] row_sel;
+    input [5:0] col;
+    begin
+        if (row_sel == 2'd0)
+            read_line = line0[col];
+        else if (row_sel == 2'd1)
+            read_line = line1[col];
+        else
+            read_line = line2[col];
+    end
+endfunction
+
+function [7:0] get_pixel_sel;
+    input zero_row;
+    input [1:0] row_sel;
     input signed [7:0] cc;
     begin
-        if (rr < 0 || rr > 63 || cc < 0 || cc > 63) begin
-            get_pixel = 8'd0;
+        if (zero_row || cc < 0 || cc > 63) begin
+            get_pixel_sel = 8'd0;
         end else begin
-            case (rr[1:0])
-                2'd0: get_pixel = line0[cc[5:0]];
-                2'd1: get_pixel = line1[cc[5:0]];
-                2'd2: get_pixel = line2[cc[5:0]];
-                default: get_pixel = line3[cc[5:0]];
-            endcase
+            get_pixel_sel = read_line(row_sel, cc[5:0]);
         end
+    end
+endfunction
+
+function [1:0] mod3_plus1;
+    input [1:0] x;
+    begin
+        if (x == 2'd2)
+            mod3_plus1 = 2'd0;
+        else
+            mod3_plus1 = x + 2'd1;
     end
 endfunction
 
@@ -107,6 +125,7 @@ function [7:0] cube_root_floor;
     reg [5:0] lo;
     reg [5:0] hi;
     reg [5:0] mid;
+    reg [6:0] mid_sum;
     reg [11:0] mid2;
     reg [17:0] mid3;
     integer k;
@@ -114,9 +133,11 @@ function [7:0] cube_root_floor;
         lo = 6'd0;
         hi = 6'd40;
         for (k = 0; k < 6; k = k + 1) begin
-            mid  = (lo + hi + 6'd1) >> 1;
+            mid_sum = {1'b0, lo} + {1'b0, hi} + 7'd1;
+            mid = mid_sum[6:1];
             mid2 = {6'd0, mid} * {6'd0, mid};
             mid3 = {6'd0, mid2} * {12'd0, mid};
+
             if (mid3 <= target)
                 lo = mid;
             else
@@ -126,12 +147,19 @@ function [7:0] cube_root_floor;
     end
 endfunction
 
+function [15:0] square_u8;
+    input [7:0] x;
+    begin
+        square_u8 = {8'd0, x} * {8'd0, x};
+    end
+endfunction
+
 function [7:0] activate_x_2_over_3;
     input [7:0] x;
     reg [15:0] sq;
     begin
         // Important: square first, then cube-root, then truncate.
-        sq = {8'd0, x} * {8'd0, x};
+        sq = square_u8(x);
         activate_x_2_over_3 = cube_root_floor(sq);
     end
 endfunction
@@ -139,12 +167,10 @@ endfunction
 function signed [21:0] mul_pixel_weight;
     input [7:0] p;
     input signed [7:0] w;
-    reg signed [21:0] p_ext;
-    reg signed [21:0] w_ext;
+    reg signed [16:0] prod;
     begin
-        p_ext = $signed({14'd0, p});
-        w_ext = {{14{w[7]}}, w};
-        mul_pixel_weight = p_ext * w_ext;
+        prod = $signed({1'b0, p}) * w;
+        mul_pixel_weight = {{5{prod[16]}}, prod};
     end
 endfunction
 
@@ -159,31 +185,6 @@ function [11:0] make_addr;
     end
 endfunction
 
-function [6:0] row_minus_2;
-    input [6:0] r;
-    begin
-        row_minus_2 = r - 7'd2;
-    end
-endfunction
-
-function [5:0] row_minus_2_low6;
-    input [6:0] r;
-    reg [6:0] tmp;
-    begin
-        tmp = r - 7'd2;
-        row_minus_2_low6 = tmp[5:0];
-    end
-endfunction
-
-function [5:0] row_minus_2_div2;
-    input [6:0] r;
-    reg [6:0] tmp;
-    begin
-        tmp = r - 7'd2;
-        row_minus_2_div2 = tmp[6:1];
-    end
-endfunction
-
 // ============================================================
 // Calculate one output pixel.
 // center_r/center_c are coordinates in the original 64x64 image.
@@ -193,25 +194,37 @@ function [7:0] calc_one;
     input [6:0] center_c;
     reg signed [7:0] cr;
     reg signed [7:0] cc;
+    reg [1:0] top_sel;
+    reg [1:0] mid_sel;
+    reg [1:0] bot_sel;
+    reg top_zero;
+    reg bot_zero;
     reg [7:0] p0, p1, p2;
     reg [7:0] p3, p4, p5;
     reg [7:0] p6, p7, p8;
     reg signed [21:0] acc;
     reg signed [21:0] rounded;
     reg [7:0] clamped;
+    reg [7:0] activated;
     begin
         cr = {1'b0, center_r};
         cc = {1'b0, center_c};
 
-        p0 = get_pixel(cr - 8'sd1, cc - 8'sd1);
-        p1 = get_pixel(cr - 8'sd1, cc          );
-        p2 = get_pixel(cr - 8'sd1, cc + 8'sd1);
-        p3 = get_pixel(cr          , cc - 8'sd1);
-        p4 = get_pixel(cr          , cc          );
-        p5 = get_pixel(cr          , cc + 8'sd1);
-        p6 = get_pixel(cr + 8'sd1, cc - 8'sd1);
-        p7 = get_pixel(cr + 8'sd1, cc          );
-        p8 = get_pixel(cr + 8'sd1, cc + 8'sd1);
+        mid_sel = center_row_mod;
+        top_sel = (center_row_mod == 2'd0) ? 2'd2 : (center_row_mod - 2'd1);
+        bot_sel = (center_row_mod == 2'd2) ? 2'd0 : (center_row_mod + 2'd1);
+        top_zero = (cr == 8'sd0);
+        bot_zero = (cr == 8'sd63);
+
+        p0 = get_pixel_sel(top_zero, top_sel, cc - 8'sd1);
+        p1 = get_pixel_sel(top_zero, top_sel, cc          );
+        p2 = get_pixel_sel(top_zero, top_sel, cc + 8'sd1);
+        p3 = get_pixel_sel(1'b0,     mid_sel, cc - 8'sd1);
+        p4 = get_pixel_sel(1'b0,     mid_sel, cc          );
+        p5 = get_pixel_sel(1'b0,     mid_sel, cc + 8'sd1);
+        p6 = get_pixel_sel(bot_zero, bot_sel, cc - 8'sd1);
+        p7 = get_pixel_sel(bot_zero, bot_sel, cc          );
+        p8 = get_pixel_sel(bot_zero, bot_sel, cc + 8'sd1);
 
         acc = 22'sd0;
         acc = acc + mul_pixel_weight(p0, w0);
@@ -235,7 +248,9 @@ function [7:0] calc_one;
         else
             clamped = rounded[7:0];
 
-        calc_one = activate_x_2_over_3(clamped);
+        activated = activate_x_2_over_3(clamped);
+
+        calc_one = activated;
     end
 endfunction
 
@@ -250,6 +265,8 @@ task emit_group;
     input [5:0] out_c_base;
     input [6:0] center_r;
     reg [6:0] c0, c1, c2, c3;
+    reg [7:0] d0, d1, d2, d3;
+    reg [11:0] a0, a1, a2, a3;
     begin
         if (stride_reg) begin
             c0 = {out_c_base, 1'b0};
@@ -263,15 +280,25 @@ task emit_group;
             c3 = {1'b0, out_c_base + 6'd3};
         end
 
-        o_out_data1  <= calc_one(center_r, c0);
-        o_out_data2  <= calc_one(center_r, c1);
-        o_out_data3  <= calc_one(center_r, c2);
-        o_out_data4  <= calc_one(center_r, c3);
+        d0 = calc_one(center_r, c0);
+        d1 = calc_one(center_r, c1);
+        d2 = calc_one(center_r, c2);
+        d3 = calc_one(center_r, c3);
 
-        o_out_addr1  <= make_addr(out_r, out_c_base);
-        o_out_addr2  <= make_addr(out_r, out_c_base + 6'd1);
-        o_out_addr3  <= make_addr(out_r, out_c_base + 6'd2);
-        o_out_addr4  <= make_addr(out_r, out_c_base + 6'd3);
+        a0 = make_addr(out_r, out_c_base);
+        a1 = make_addr(out_r, out_c_base + 6'd1);
+        a2 = make_addr(out_r, out_c_base + 6'd2);
+        a3 = make_addr(out_r, out_c_base + 6'd3);
+
+        o_out_data1  <= d0;
+        o_out_data2  <= d1;
+        o_out_data3  <= d2;
+        o_out_data4  <= d3;
+
+        o_out_addr1  <= a0;
+        o_out_addr2  <= a1;
+        o_out_addr3  <= a2;
+        o_out_addr4  <= a3;
 
         o_out_valid1 <= 1'b1;
         o_out_valid2 <= 1'b1;
@@ -285,7 +312,7 @@ endtask
 // ============================================================
 task write_input_group;
     begin
-        case (read_row[1:0])
+        case (read_row_mod)
             2'd0: begin
                 line0[in_col_base    ] <= i_in_data[31:24];
                 line0[in_col_base + 6'd1] <= i_in_data[23:16];
@@ -305,10 +332,6 @@ task write_input_group;
                 line2[in_col_base + 6'd3] <= i_in_data[7:0];
             end
             default: begin
-                line3[in_col_base    ] <= i_in_data[31:24];
-                line3[in_col_base + 6'd1] <= i_in_data[23:16];
-                line3[in_col_base + 6'd2] <= i_in_data[15:8];
-                line3[in_col_base + 6'd3] <= i_in_data[7:0];
             end
         endcase
     end
@@ -341,16 +364,17 @@ always @(posedge i_clk or negedge i_rst_n) begin
         w6 <= 8'sd0; w7 <= 8'sd0; w8 <= 8'sd0;
         stride_reg <= 1'b0;
 
-        read_row <= 7'd0;
+        loaded_count <= 7'd0;
+        read_row_mod <= 2'd0;
         read_grp <= 4'd0;
-        flush_out_r <= 6'd0;
-        flush_grp <= 4'd0;
+        out_row <= 6'd0;
+        out_grp <= 4'd0;
+        center_row_mod <= 2'd0;
 
         for (i = 0; i < 64; i = i + 1) begin
             line0[i] <= 8'd0;
             line1[i] <= 8'd0;
             line2[i] <= 8'd0;
-            line3[i] <= 8'd0;
         end
     end else begin
         // default output behavior
@@ -392,68 +416,46 @@ always @(posedge i_clk or negedge i_rst_n) begin
             // ------------------------------------------------------------
             S_GAP: begin
                 o_in_ready <= 1'b0;
-                read_row <= 7'd0;
+                loaded_count <= 7'd0;
+                read_row_mod <= 2'd0;
                 read_grp <= 4'd0;
-                state <= S_STREAM;
+                out_row <= 6'd0;
+                out_grp <= 4'd0;
+                center_row_mod <= 2'd0;
+                state <= S_DECIDE;
             end
 
             // ------------------------------------------------------------
-            // Receive the whole image continuously.
-            // At the same time, output already-computable rows.
-            //
-            // stride=1 schedule:
-            //   while reading row 2, output row 0
-            //   while reading row 3, output row 1
-            //   ...
-            //   while reading row 63, output row 61
-            //   flush rows 62 and 63
-            //
-            // stride=2 schedule:
-            //   while reading row 2, output center row 0  -> out row 0
-            //   while reading row 4, output center row 2  -> out row 1
-            //   ...
-            //   while reading row 62, output center row 60 -> out row 30
-            //   flush center row 62 -> out row 31
+            // Read rows only when the current 3x3 window needs one more
+            // source row. Otherwise calculate one output row with ready low.
             // ------------------------------------------------------------
-            S_STREAM: begin
+            S_DECIDE: begin
+                if (need_read_more) begin
+                    o_in_ready <= 1'b1;
+                    read_grp <= 4'd0;
+                    state <= S_READ;
+                end else begin
+                    o_in_ready <= 1'b0;
+                    out_grp <= 4'd0;
+                    state <= S_CALC;
+                end
+            end
+
+            // ------------------------------------------------------------
+            // Read exactly one 64-pixel source row, 4 pixels per cycle.
+            // ------------------------------------------------------------
+            S_READ: begin
                 o_in_ready <= 1'b1;
 
                 if (i_in_valid) begin
                     write_input_group();
 
-                    if (!stride_reg) begin
-                        // stride = 1, 64 outputs per row, 16 groups per row
-                        if (read_row >= 7'd2) begin
-                            emit_group(
-                                row_minus_2_low6(read_row),
-                                {read_grp, 2'b00},
-                                row_minus_2(read_row)
-                            );
-                        end
-                    end else begin
-                        // stride = 2, 32 outputs per row, 8 groups per output row
-                        if ((read_row >= 7'd2) && (read_row[0] == 1'b0) && (read_grp <= 4'd7)) begin
-                            emit_group(
-                                row_minus_2_div2(read_row),
-                                {1'b0, read_grp[2:0], 2'b00},
-                                row_minus_2(read_row)
-                            );
-                        end
-                    end
-
                     if (read_grp == 4'd15) begin
                         read_grp <= 4'd0;
-                        if (read_row == 7'd63) begin
-                            o_in_ready <= 1'b0;
-                            flush_grp <= 4'd0;
-                            if (stride_reg)
-                                flush_out_r <= 6'd31;
-                            else
-                                flush_out_r <= 6'd62;
-                            state <= S_FLUSH;
-                        end else begin
-                            read_row <= read_row + 7'd1;
-                        end
+                        loaded_count <= loaded_count + 7'd1;
+                        read_row_mod <= mod3_plus1(read_row_mod);
+                        o_in_ready <= 1'b0;
+                        state <= S_DECIDE;
                     end else begin
                         read_grp <= read_grp + 4'd1;
                     end
@@ -461,43 +463,31 @@ always @(posedge i_clk or negedge i_rst_n) begin
             end
 
             // ------------------------------------------------------------
-            // Flush last output row(s) after all input rows are received.
+            // Calculate one output row. Each cycle emits 4 output pixels.
             // ------------------------------------------------------------
-            S_FLUSH: begin
+            S_CALC: begin
                 o_in_ready <= 1'b0;
 
                 if (!stride_reg) begin
-                    // stride=1: flush output rows 62 and 63, 16 groups each
-                    emit_group(
-                        flush_out_r,
-                        {flush_grp, 2'b00},
-                        {1'b0, flush_out_r}
-                    );
-
-                    if (flush_grp == 4'd15) begin
-                        flush_grp <= 4'd0;
-                        if (flush_out_r == 6'd62) begin
-                            flush_out_r <= 6'd63;
-                        end else begin
-                            state <= S_FINISH;
-                        end
-                    end else begin
-                        flush_grp <= flush_grp + 4'd1;
-                    end
+                    emit_group(out_row, {out_grp, 2'b00}, center_row);
                 end else begin
-                    // stride=2: flush only output row 31, center row 62, 8 groups
-                    emit_group(
-                        6'd31,
-                        {1'b0, flush_grp[2:0], 2'b00},
-                        7'd62
-                    );
+                    emit_group(out_row, {1'b0, out_grp[2:0], 2'b00}, center_row);
+                end
 
-                    if (flush_grp == 4'd7) begin
-                        flush_grp <= 4'd0;
+                if (out_grp == last_out_grp) begin
+                    out_grp <= 4'd0;
+                    if (out_row == last_out_row) begin
                         state <= S_FINISH;
                     end else begin
-                        flush_grp <= flush_grp + 4'd1;
+                        out_row <= out_row + 6'd1;
+                        if (stride_reg)
+                            center_row_mod <= mod3_plus1(mod3_plus1(center_row_mod));
+                        else
+                            center_row_mod <= mod3_plus1(center_row_mod);
+                        state <= S_DECIDE;
                     end
+                end else begin
+                    out_grp <= out_grp + 4'd1;
                 end
             end
 
