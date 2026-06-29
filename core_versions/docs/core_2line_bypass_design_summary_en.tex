@@ -1,0 +1,168 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{listings}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single
+}
+
+\title{Design Summary of \texttt{core\_2line\_bypass\_fifo\_pixpipe\_lanepix\_drain11.v}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Overview}
+
+\texttt{core\_2line\_bypass\_fifo\_pixpipe\_lanepix\_drain11.v} is a streaming convolution core optimized for low area and stable timing. The key idea is to use only two full line buffers, combine them with an input-row bypass FIFO, and insert a lightweight pixel pipeline before the MAC stage. This avoids a large 3-line or 4-line buffer structure while keeping a throughput of up to four output pixels per cycle.
+
+\section*{Workflow and FSM}
+
+The workflow is controlled by the following FSM states:
+
+\begin{itemize}
+  \item \texttt{S\_IDLE}: Initializes the core and asserts \texttt{o\_in\_ready}.
+  \item \texttt{S\_GET\_W}: Loads the 3$\times$3 kernel weights into \texttt{w0}--\texttt{w8}, stores \texttt{stride\_reg}, and clears \texttt{emit\_base\_addr}.
+  \item \texttt{S\_LOAD0} / \texttt{S\_LOAD1}: Loads the first two image rows into \texttt{line0} and \texttt{line1}.
+  \item \texttt{S\_PRE\_ROW0}: Computes output row 0. The top row is treated as zero padding.
+  \item \texttt{S\_STREAM}: Main streaming state. Each input word contains four pixels. The core uses \texttt{prev2\_grp}, \texttt{prev1\_grp}, and \texttt{i\_in\_data} as a 3-group FIFO for the current input row.
+  \item \texttt{S\_ROW\_FLUSH}: Handles right-boundary zero padding and writes delayed input groups back into the circular line buffer.
+  \item \texttt{S\_FINAL\_ROW}: Handles the final output row. The bottom row is treated as zero padding.
+  \item \texttt{S\_DRAIN}: Waits for the internal pipeline to flush. This version uses \texttt{drain\_count == 4'd11}.
+  \item \texttt{S\_FINISH}: Asserts \texttt{o\_exe\_finish}.
+\end{itemize}
+
+\section*{Two-Line Buffer and Bypass FIFO}
+
+The design keeps only two full line buffers:
+
+\begin{lstlisting}[language=Verilog]
+line0[0:63]
+line1[0:63]
+\end{lstlisting}
+
+A 3$\times$3 convolution window needs three rows. Instead of storing three full rows, this design uses the top row from one line buffer, the middle row from the other line buffer, and the bottom row from the current input stream through a bypass FIFO.
+
+The bypass FIFO consists of:
+
+\begin{lstlisting}[language=Verilog]
+prev2_grp
+prev1_grp
+i_in_data
+\end{lstlisting}
+
+Each group contains four pixels, so three groups provide enough horizontal pixels for both stride=1 and stride=2 windows. This reduces storage and avoids a large sliding-window register structure.
+
+\section*{Pixel Pipeline and Lane-Pixel Format}
+
+A previous rowsum version placed pixel selection, multiplication, and row summation in one cycle:
+
+\begin{lstlisting}
+pixel select -> multiplier -> row_sum
+\end{lstlisting}
+
+That path was too long. This version splits it into:
+
+\begin{lstlisting}
+Cycle A: select pixels -> pixel registers
+Cycle B: multiply + row_sum -> sum registers
+\end{lstlisting}
+
+The current implementation also uses a lane-pixel format:
+
+\begin{lstlisting}[language=Verilog]
+pix_t0~pix_t3[0:2]
+pix_m0~pix_m3[0:2]
+pix_b0~pix_b3[0:2]
+\end{lstlisting}
+
+Each lane already contains its own 3$\times$3 pixel window. Therefore, the MAC stage does not need a stride-dependent mux.
+
+For stride=1:
+
+\begin{lstlisting}
+lane0: pixels 0,1,2
+lane1: pixels 1,2,3
+lane2: pixels 2,3,4
+lane3: pixels 3,4,5
+\end{lstlisting}
+
+For stride=2:
+
+\begin{lstlisting}
+lane0: pixels 0,1,2
+lane1: pixels 2,3,4
+lane2: pixels 4,5,6
+lane3: pixels 6,7,8
+\end{lstlisting}
+
+The stride difference is handled in the pixel stage, making the MAC stage simpler and more timing-friendly.
+
+\section*{Convolution and Activation}
+
+For each output pixel, \texttt{mul\_pixel\_weight()} converts the unsigned pixel to signed form and multiplies it by a signed weight. Then \texttt{row\_sum3()} adds three products from one row, and \texttt{row\_total3()} adds the top, middle, and bottom row sums to form the convolution result.
+
+The activation is applied in three steps. First, \texttt{clamp\_acc()} rounds the accumulator using:
+
+\begin{lstlisting}[language=Verilog]
+(acc + 64) >>> 7
+\end{lstlisting}
+
+It then clamps the result to the range 0--255. Next, \texttt{square\_u8()} computes $x^2$. Finally, a digit cube-root pipeline computes:
+
+\[
+x^{2/3} = \sqrt[3]{x^2}
+\]
+
+The cube-root pipeline uses six digit stages: 32, 16, 8, 4, 2, and 1. Each stage updates root, root$^2$, and root$^3$ using arithmetic formulas and compares the candidate value against the target. This is not a LUT; it is a digit-by-digit arithmetic cube-root implementation.
+
+\section*{Output Address Counter}
+
+Instead of passing address registers through every pipeline stage, this version uses one output counter:
+
+\begin{lstlisting}[language=Verilog]
+emit_base_addr
+\end{lstlisting}
+
+When \texttt{pipe\_valid[5]} is asserted, the core outputs:
+
+\begin{lstlisting}[language=Verilog]
+addr1 = emit_base_addr
+addr2 = emit_base_addr + 1
+addr3 = emit_base_addr + 2
+addr4 = emit_base_addr + 3
+\end{lstlisting}
+
+Then \texttt{emit\_base\_addr} increments by four. Since the output order is raster order, this removes unnecessary address pipeline registers.
+
+\section*{Area and Timing Trade-Offs}
+
+The main trade-off is adding a small number of pixel registers to reduce the critical path. The rowsum-only version used fewer registers, but its critical path was:
+
+\begin{lstlisting}
+pixel selection + multiplier + row_sum
+\end{lstlisting}
+
+At a tight 0.6 ns clock, synthesis may need larger cells or duplicated logic to meet timing, increasing area.
+
+The pixel-pipeline version adds pixel registers, but shortens the path:
+
+\begin{lstlisting}
+pixel selection -> FF
+multiplier + row_sum -> FF
+\end{lstlisting}
+
+This reduces timing pressure, allowing synthesis to use smaller logic. As a result, total area can decrease even though the RTL has more registers.
+
+The lane-pixel format adds some structured pixel registers, but removes the stride mux before the MAC stage. This makes the arithmetic datapath cleaner and easier to optimize.
+
+Overall, this version balances area and timing by keeping high 4-output throughput, avoiding large line/window storage, avoiding full product registers, and using carefully placed pipeline boundaries.
+
+\end{document}

@@ -119,47 +119,30 @@ function [15:0] square_u8;
     end
 endfunction
 
-function signed [21:0] mul_pixel_weight;
+function signed [19:0] mul_pixel_weight;
     input [7:0] p;
     input signed [7:0] w;
     reg signed [16:0] prod;
     begin
         prod = $signed({1'b0, p}) * w;
-        mul_pixel_weight = {{5{prod[16]}}, prod};
+        mul_pixel_weight = {{3{prod[16]}}, prod};
     end
 endfunction
 
-function [5:0] cube_next_lo;
+function [11:0] cube_next_pair;
     input [5:0] lo;
     input [5:0] hi;
     input [15:0] target;
     reg [6:0] mid_sum;
     reg [5:0] mid;
-    reg [11:0] mid2;
-    reg [17:0] mid3;
+    reg [10:0] mid2;
+    reg [15:0] mid3;
     begin
         mid_sum = {1'b0, lo} + {1'b0, hi} + 7'd1;
         mid = mid_sum[6:1];
-        mid2 = {6'd0, mid} * {6'd0, mid};
-        mid3 = {6'd0, mid2} * {12'd0, mid};
-        cube_next_lo = (mid3 <= target) ? mid : lo;
-    end
-endfunction
-
-function [5:0] cube_next_hi;
-    input [5:0] lo;
-    input [5:0] hi;
-    input [15:0] target;
-    reg [6:0] mid_sum;
-    reg [5:0] mid;
-    reg [11:0] mid2;
-    reg [17:0] mid3;
-    begin
-        mid_sum = {1'b0, lo} + {1'b0, hi} + 7'd1;
-        mid = mid_sum[6:1];
-        mid2 = {6'd0, mid} * {6'd0, mid};
-        mid3 = {6'd0, mid2} * {12'd0, mid};
-        cube_next_hi = (mid3 <= target) ? hi : (mid - 6'd1);
+        mid2 = {5'd0, mid} * {5'd0, mid};
+        mid3 = {5'd0, mid2} * {10'd0, mid};
+        cube_next_pair = (mid3 <= target) ? {hi, mid} : {(mid - 6'd1), lo};
     end
 endfunction
 
@@ -211,8 +194,8 @@ function [7:0] calc_clamped;
     reg [7:0] p0, p1, p2;
     reg [7:0] p3, p4, p5;
     reg [7:0] p6, p7, p8;
-    reg signed [21:0] acc;
-    reg signed [21:0] rounded;
+    reg signed [19:0] acc;
+    reg signed [19:0] rounded;
     reg [7:0] clamped;
     begin
         cr = {1'b0, center_r};
@@ -228,7 +211,7 @@ function [7:0] calc_clamped;
         p7 = get_pixel(cr + 8'sd1, cc          );
         p8 = get_pixel(cr + 8'sd1, cc + 8'sd1);
 
-        acc = 22'sd0;
+        acc = 20'sd0;
         acc = acc + mul_pixel_weight(p0, w0);
         acc = acc + mul_pixel_weight(p1, w1);
         acc = acc + mul_pixel_weight(p2, w2);
@@ -241,11 +224,11 @@ function [7:0] calc_clamped;
 
         // Q0.7 -> integer. Add 0.5 LSB and arithmetic shift.
         // This implements nearest integer, ties toward positive infinity.
-        rounded = (acc + 22'sd64) >>> 7;
+        rounded = (acc + 20'sd64) >>> 7;
 
         if (rounded < 0)
             clamped = 8'd0;
-        else if (rounded > 22'sd255)
+        else if (rounded > 20'sd255)
             clamped = 8'd255;
         else
             clamped = rounded[7:0];
@@ -296,14 +279,10 @@ task push_group;
         pipe_target2[0] <= t2;
         pipe_target3[0] <= t3;
 
-        pipe_lo0[0] <= cube_next_lo(6'd0, 6'd40, t0);
-        pipe_hi0[0] <= cube_next_hi(6'd0, 6'd40, t0);
-        pipe_lo1[0] <= cube_next_lo(6'd0, 6'd40, t1);
-        pipe_hi1[0] <= cube_next_hi(6'd0, 6'd40, t1);
-        pipe_lo2[0] <= cube_next_lo(6'd0, 6'd40, t2);
-        pipe_hi2[0] <= cube_next_hi(6'd0, 6'd40, t2);
-        pipe_lo3[0] <= cube_next_lo(6'd0, 6'd40, t3);
-        pipe_hi3[0] <= cube_next_hi(6'd0, 6'd40, t3);
+        {pipe_hi0[0], pipe_lo0[0]} <= cube_next_pair(6'd0, 6'd40, t0);
+        {pipe_hi1[0], pipe_lo1[0]} <= cube_next_pair(6'd0, 6'd40, t1);
+        {pipe_hi2[0], pipe_lo2[0]} <= cube_next_pair(6'd0, 6'd40, t2);
+        {pipe_hi3[0], pipe_lo3[0]} <= cube_next_pair(6'd0, 6'd40, t3);
 
         pipe_addr0[0] <= make_addr(out_r, out_c_base);
         pipe_addr1[0] <= make_addr(out_r, out_c_base + 6'd1);
@@ -426,14 +405,10 @@ always @(posedge i_clk or negedge i_rst_n) begin
             pipe_target1[pi] <= pipe_target1[pi-1];
             pipe_target2[pi] <= pipe_target2[pi-1];
             pipe_target3[pi] <= pipe_target3[pi-1];
-            pipe_lo0[pi] <= cube_next_lo(pipe_lo0[pi-1], pipe_hi0[pi-1], pipe_target0[pi-1]);
-            pipe_hi0[pi] <= cube_next_hi(pipe_lo0[pi-1], pipe_hi0[pi-1], pipe_target0[pi-1]);
-            pipe_lo1[pi] <= cube_next_lo(pipe_lo1[pi-1], pipe_hi1[pi-1], pipe_target1[pi-1]);
-            pipe_hi1[pi] <= cube_next_hi(pipe_lo1[pi-1], pipe_hi1[pi-1], pipe_target1[pi-1]);
-            pipe_lo2[pi] <= cube_next_lo(pipe_lo2[pi-1], pipe_hi2[pi-1], pipe_target2[pi-1]);
-            pipe_hi2[pi] <= cube_next_hi(pipe_lo2[pi-1], pipe_hi2[pi-1], pipe_target2[pi-1]);
-            pipe_lo3[pi] <= cube_next_lo(pipe_lo3[pi-1], pipe_hi3[pi-1], pipe_target3[pi-1]);
-            pipe_hi3[pi] <= cube_next_hi(pipe_lo3[pi-1], pipe_hi3[pi-1], pipe_target3[pi-1]);
+            {pipe_hi0[pi], pipe_lo0[pi]} <= cube_next_pair(pipe_lo0[pi-1], pipe_hi0[pi-1], pipe_target0[pi-1]);
+            {pipe_hi1[pi], pipe_lo1[pi]} <= cube_next_pair(pipe_lo1[pi-1], pipe_hi1[pi-1], pipe_target1[pi-1]);
+            {pipe_hi2[pi], pipe_lo2[pi]} <= cube_next_pair(pipe_lo2[pi-1], pipe_hi2[pi-1], pipe_target2[pi-1]);
+            {pipe_hi3[pi], pipe_lo3[pi]} <= cube_next_pair(pipe_lo3[pi-1], pipe_hi3[pi-1], pipe_target3[pi-1]);
             pipe_addr0[pi] <= pipe_addr0[pi-1];
             pipe_addr1[pi] <= pipe_addr1[pi-1];
             pipe_addr2[pi] <= pipe_addr2[pi-1];
