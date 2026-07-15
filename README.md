@@ -2,6 +2,30 @@
 
 This repository contains the RTL design history, final submission files, synthesis constraints, and project report for the ICD final project.
 
+## Problem Overview and Processing Flow
+
+The project implements a hardware accelerator for a small convolutional image-processing layer. The input is a 64-by-64 image, delivered as 32-bit words with four 8-bit pixels per word, plus one 3-by-3 signed weight kernel and a stride mode.
+
+For each output pixel, the core performs the following operations:
+
+1. Build a 3-by-3 image window around the selected center pixel. Boundary pixels outside the 64-by-64 image are treated as zero padding.
+2. Multiply the nine window pixels by the nine kernel weights and sum the products to produce the convolution result.
+3. Round and scale the convolution accumulator, then clamp it to the 8-bit range 0--255.
+4. Apply the activation function:
+
+   ```text
+   x^(2/3) = cube_root(x^2)
+   ```
+
+5. Emit the activated result with its output address.
+
+The stride mode changes how output locations map back to the input image:
+
+- stride = 1: every input row and column is used as an output center, producing a 64-by-64 output map.
+- stride = 2: only every other input row and column is used as an output center, producing a 32-by-32 output map.
+
+The final architecture keeps this algorithm streaming. It accepts input rows, maintains only the row context needed for the current 3-by-3 windows, computes up to four output pixels per group, and lets the convolution, clamp, square, cube-root, and output-address stages run as a pipeline.
+
 ## Repository Layout
 
 ### `final_submission/`
@@ -53,7 +77,11 @@ The final design processes the image in a streaming manner. Instead of keeping t
 
 - top row: read from one line buffer,
 - middle row: read from the other line buffer,
-- bottom row: generated from `prev2_grp`, `prev1_grp`, and current input data.
+- bottom row: generated from the live input stream through `prev2_grp`, `prev1_grp`, and current input data.
+
+The bottom row is the main reason the two-line design works. A 3-by-3 window needs three rows, but the newest row does not have to be stored as a full third line immediately. Instead, incoming 32-bit input groups are shifted through `prev2_grp`, `prev1_grp`, and `i_in_data`, giving the pixel stage enough neighboring columns to form the bottom part of each lane window. After the old top-row columns have already been consumed, the delayed input groups are written back into the line buffer selected by `write_sel`. This delayed writeback prevents the design from overwriting pixels that are still needed as the top row for the current output row.
+
+For stride 1, an output group uses adjacent center columns, so the bottom window can be assembled from a carry pixel, the previous input group, and the current input group. For stride 2, the pixel stage selects every other source column from the same FIFO-style stream. In both modes, stride-dependent pixel selection is handled before the MAC stage.
 
 A lane-pixel pipeline organizes the required 3-by-3 pixels for four output lanes before the MAC stage. This removes stride-dependent muxing from the arithmetic stage and improves timing stability.
 
